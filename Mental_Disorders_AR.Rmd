@@ -1,0 +1,476 @@
+---
+title: "Association Rules Applied to Mental Disorders Survey Data in R"
+author: "Elizaveta Sokolova"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: cosmo
+    number_sections: true
+  pdf_document:
+    toc: true
+    toc_depth: '3'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, 
+                      fig.width = 14, fig.height = 10, error = FALSE)
+
+# Load all required packages
+library(arules)
+library(arulesViz)
+library(tidyverse)
+library(RColorBrewer)
+library(knitr)
+library(ggplot2)
+library(dplyr)
+```
+
+# Description
+
+Association rules is an unsupervised learning algorithm which is sharpened for the purpose of finding patterns in data such as market basket analysis or customer preferences to create recommendation systems.
+
+Despite the fact that those are the most popular applications, this study shows how the association rules algorithms may help to analyze survey data, and namely, **psychological and behavioral questionnaires for mental disorder diagnosis**. 
+The current dataset is collected from a private psychology clinic. This dataset comprised 30 samples for each of the Normal, Mania Bipolar Disorder, Depressive Bipolar Disorder, and Major Depressive Disorder categories summing up to 120 patiants. The dataset contains the 17 essential symptoms psychiatrists use to diagnose the described disorders. 
+
+Source of dataset: https://dataverse.harvard.edu/dataset.xhtml?persistentId=doi:10.7910/DVN/0FNET5
+
+This implementation may help to better understand the causalities between the patients' characteristics and symptom patterns, extending beyond simple correlation analysis.
+
+Step-by-step, the work will look as follows:
+
+1. Loading and inspecting data
+2. Feature preprocessing (discretization of rating scales)
+3. Frequency inspection of symptoms
+4. Discovering symptom patterns and diagnostic rules
+5. Visualization and clinical interpretation
+
+# Data
+
+The data covers four diagnostic categories:
+
+- **Bipolar Type-1** (Mania Bipolar Disorder)
+- **Bipolar Type-2** (Depressive Bipolar Disorder)  
+- **Major Depressive Disorder**
+- **Normal** (healthy individuals)
+
+The responses were provided on various scales (Likert-type, YES/NO, and 1-10 ratings). Let us load the data first and look at how it looks like.
+
+```{r load_data}
+# Loading the data
+df <- read.csv("Dataset-Mental-Disorders.csv", 
+               stringsAsFactors = FALSE, check.names = FALSE)
+
+# Clean column names
+colnames(df) <- gsub("ï»¿", "", colnames(df))
+colnames(df) <- trimws(colnames(df))
+
+# Limiting the data to symptoms and diagnosis
+df <- df[complete.cases(df), -1]  # Remove patient number
+
+head(df)
+```
+
+```{r data_structure}
+str(df)
+```
+
+```{r data_summary}
+summary(df)
+```
+
+As we see, we have 120 patients with 17 symptom variables and 1 diagnosis variable. The variables are a mix of categorical responses (Seldom, Sometimes, Usually, Most-Often, YES, NO) and rating scales (X From 10).
+
+# Feature Preprocessing
+
+Following best practices for association rules on psychological data, we need to discretize and prepare the features.
+
+## Diagnosis Distribution
+
+First, let's examine our target variable:
+
+```{r diagnosis_dist}
+table(df$`Expert Diagnose`)
+```
+
+The dataset is fairly balanced across the four diagnostic categories, which is excellent for association rule mining.
+
+## Processing Symptoms
+
+We need to:
+
+1. Clean column names for easier handling
+2. Discretize rating scales (Sexual Activity, Concentration, Optimism)
+3. Handle whitespace inconsistencies
+
+```{r preprocessing}
+# Create clean dataset
+data <- df
+
+# Clean column names - replace spaces and special characters
+colnames(data) <- gsub(" ", "_", colnames(data))
+colnames(data) <- gsub("-", "_", colnames(data))
+
+# Trim whitespace from all character columns
+data <- data %>%
+  mutate(across(where(is.character), str_trim))
+
+# Function to categorize ratings from "X From 10" format
+# Following psychological survey discretization practices
+categorize_rating <- function(x) {
+  numeric_val <- as.numeric(gsub(" From 10", "", x))
+  case_when(
+    numeric_val <= 3 ~ "Low",
+    numeric_val >= 7 ~ "High",
+    TRUE ~ "Medium"
+  )
+}
+
+# Apply categorization to rating columns
+data <- data %>%
+  mutate(
+    Sexual_Activity = categorize_rating(Sexual_Activity),
+    Concentration = categorize_rating(Concentration),
+    Optimisim = categorize_rating(Optimisim)
+  ) %>%
+  rename(
+    Sleep_Disorder = Sleep_dissorder,
+    Anorexia = Anorxia,
+    Ignore_Move_On = `Ignore_&_Move_On`,
+    Nervous_Breakdown = Nervous_Break_down,
+    Diagnosis = Expert_Diagnose
+  )
+```
+
+Now we have preprocessed data ready for transaction format conversion.
+
+# Data Format for Association Rules
+
+## Converting Patient Profiles to Analyzable Format
+
+For association rules, we need to convert each patient's symptom profile into a format where each symptom-value combination becomes an analyzable element. 
+
+For example, a patient with Bipolar Type-2 might have characteristics like:
+`{Mood_Swing=YES, Sadness=Usually, Suicidal_thoughts=YES, Nervous_Breakdown=YES, Diagnosis=Bipolar Type-2, ...}`
+
+This allows us to discover patterns such as: "Patients with {Mood Swings=YES, Sadness=Usually} → often have {Diagnosis=Bipolar Type-2}."
+
+```{r create_transactions}
+# Create patient profile format for analysis
+create_patient_profiles <- function(df) {
+  profile_list <- list()
+  for (i in 1:nrow(df)) {
+    characteristics <- character()
+    for (col in colnames(df)) {
+      value <- df[i, col]
+      if (!is.na(value) && value != "") {
+        characteristics <- c(characteristics, paste0(col, "=", value))
+      }
+    }
+    profile_list[[i]] <- characteristics
+  }
+  return(profile_list)
+}
+
+# Convert patient data to analyzable format
+patient_profiles <- create_patient_profiles(data)
+patient_data <- as(patient_profiles, "transactions")
+
+# Inspect sample patient profiles
+inspect(patient_data[1:5])
+```
+
+## Patient Data Summary
+
+```{r trans_summary}
+summary(patient_data)
+```
+
+So, now we have **`r length(patient_data)` patient profiles** encoded as symptom-value combinations.
+
+## Symptom Frequency Inspection
+
+Next, we check the most frequent symptom-value combinations in our dataset:
+
+```{r item_freq_sorted}
+sort(round(itemFrequency(patient_data), 3), decreasing = TRUE)[1:20]
+```
+
+```{r item_freq_plot, fig.width=14, fig.height=8}
+itemFrequencyPlot(patient_data, topN = 30, type = "relative", 
+                  main = "Top 30 Most Common Symptom-Value Combinations", 
+                  cex.names = 0.7, las = 2)
+```
+
+So, we can see the distribution of the most common symptom characteristics in our patient population.
+
+## Symptom Co-occurrence Analysis (Cross-Tabulation)
+
+A useful way to examine symptom co-occurrence is through cross-tabulation tables showing both support and lift measures for symptom pairs.
+
+```{r cross_tabs}
+# Support cross-table: How often do symptom pairs occur together?
+sup_tab <- crossTable(patient_data, measure = "support", sort = TRUE)
+round(sup_tab[1:10, 1:10], 3)
+```
+
+```{r cross_tabs_lift}
+# Lift cross-table: How much more often than random do pairs occur?
+lift_tab <- crossTable(patient_data, measure = "lift", sort = TRUE)
+round(lift_tab[1:10, 1:10], 3)
+```
+
+These tables show us how frequently symptom pairs occur together (support) and how their co-occurrence compares to what we'd expect if symptoms were independent (lift).
+
+Lets check the symptoms by Diagnosis.
+
+```{r freq_plot, fig.width=14, fig.height=10}
+par(mfrow = c(2, 2), mar = c(8, 4, 3, 1))
+for (d in c("Bipolar Type-1", "Bipolar Type-2", "Depression", "Normal")) {
+  s <- subset(patient_data, items %in% paste0("Diagnosis=", d))[, !grepl("Diagnosis", itemLabels(patient_data))]
+  itemFrequencyPlot(s, topN = 5, main = d, cex.names = 0.9, las = 2)
+}
+par(mfrow = c(1, 1))
+```
+
+# Apriori Algorithm for Symptom Pattern Discovery
+
+For discovering associations in psychological characteristics, we use the **Apriori algorithm**. In R, the `arules` and `arulesViz` packages are used.
+
+## Theoretical Introduction
+
+To determine which symptom patterns are clinically relevant, we focus on 3 key measures:
+
+**Support** indicates how frequently a symptom pattern appears in the patient population:
+
+$$\text{Support}(X) = \frac{\text{frequency}(X)}{n}$$
+
+**Confidence** tells us the conditional probability - what proportion of patients with symptom pattern X also have outcome Y:
+
+$$\text{Confidence}(X \Rightarrow Y) = \frac{P(X \cap Y)}{P(X)} = P(Y|X)$$
+
+**Lift** compares observed co-occurrence vs. expected co-occurrence if symptoms were independent:
+
+$$\text{Lift}(X \Rightarrow Y) = \frac{P(X \cap Y)}{P(X) \times P(Y)}$$
+
+To identify clinically meaningful associations:
+- **Support**: Should be substantial enough (we use >= 10% for general patterns, >= 5% for diagnosis-specific)
+- **Confidence**: Higher is better (we use >= 60% for reliable patterns)
+- **Lift**: Greater than 1 indicates positive association (the higher, the stronger)
+
+## Discovering General Symptom Patterns
+
+We begin by mining general patterns with moderate parameters to identify the most common and reliable symptom associations across all patients.
+
+```{r general_rules}
+# Mining symptom patterns with moderate parameters
+rules_general <- apriori(patient_data, parameter = list(supp = 0.1, conf = 0.7))
+
+rules_byconf <- sort(rules_general, by = "confidence", decreasing = TRUE)
+
+inspect(head(rules_byconf, 10), digits = 2, linebreak = FALSE)
+```
+
+```{r rules_bylift}
+rules_bylift <- head(sort(rules_general, by = "lift", decreasing = TRUE), 10)
+inspect(rules_bylift, digits = 2, linebreak = FALSE)
+```
+
+As we see, some strong patterns are emerging. Let's visualize these rules.
+
+## Visualization of General Rules
+
+```{r viz_paracoord, fig.width=16, fig.height=10}
+# Parallel coordinates plot (limit to top 25 for performance)
+
+plot(rules_bylift, method = "paracoord", control = list(reorder = TRUE),
+     main = paste("Parallel Coordinates Plot -", length(rules_bylift), "Rules"))
+```
+
+```{r viz_graph, fig.width=14, fig.height=10}
+# Graph visualization 
+rules_graph <- head(sort(rules_general, by = "lift", decreasing = TRUE), 40)
+  
+plot(rules_graph, method = "graph", 
+       measure = "support", shading = "lift",
+       main = "Network Graph of Association Rules")
+```
+
+However, to better understand the diagnostic patterns, we need to check specific consequents (diagnoses).
+
+# Diagnosis-Specific Association Rules
+
+Now we will examine rules that predict each specific diagnosis.
+
+## Symptom Patterns Predicting Bipolar Type-1
+
+What symptom combinations are characteristic of patients diagnosed with Bipolar Type-1? We mine rules where the diagnosis appears as the consequent.
+
+```{r rules_bipolar1}
+rules_bipolar1 <- apriori(data = patient_data, 
+                          parameter = list(supp = 0.1, conf = 0.6), 
+                          appearance = list(default = "lhs", 
+                                           rhs = "Diagnosis=Bipolar Type-1"), 
+                          control = list(verbose = FALSE))
+
+cat("Found", length(rules_bipolar1), "rules for Bipolar Type-1\n\n")
+
+inspect(sort(rules_bipolar1, by = "confidence", decreasing = TRUE)[1:10], digits = 2, linebreak = FALSE)
+```
+
+```{r viz_bipolar1_lift}
+inspect(sort(rules_bipolar1, by = "lift", decreasing = TRUE)[1:10], digits = 2, linebreak = FALSE)
+```
+
+### Visualization: Bipolar Type-1
+
+```{r viz_bp1_paracoord, fig.width=16, fig.height=10}
+rules_viz <- head(sort(rules_bipolar1, by = "lift", decreasing = TRUE), 10)
+  
+plot(rules_viz, method = "paracoord", control = list(reorder = TRUE), main = "Symptom Patterns Leading to Bipolar Type-1")
+
+```
+
+```{r viz_bp1_grouped, fig.width=14, fig.height=10}
+plot(rules_bipolar1, method="grouped") 
+```
+
+**Interpretation**: Looking at the rules, we can see that Bipolar Type-1 is strongly associated with mood swings, no authority respect and **aggressive responses.
+
+## Symptom Patterns Predicting Bipolar Type-2
+
+What distinguishes Bipolar Type-2 from other diagnoses?
+
+```{r rules_bipolar2}
+rules_bipolar2 <- apriori(data = patient_data, 
+                          parameter = list(supp = 0.1, conf = 0.6), 
+                          appearance = list(default = "lhs", 
+                                           rhs = "Diagnosis=Bipolar Type-2"), 
+                          control = list(verbose = FALSE))
+
+cat("Found", length(rules_bipolar2), "rules for Bipolar Type-2\n\n")
+
+inspect(sort(rules_bipolar2, by = "confidence", decreasing = TRUE)[1:10], digits = 2, linebreak = FALSE)
+```
+```{r viz_bipolar2_lift}
+inspect(sort(rules_bipolar2, by = "lift", decreasing = TRUE)[1:10], digits = 2, linebreak = FALSE)
+```
+
+### Visualization: Bipolar Type-2
+
+```{r viz_bp2_paracoord, fig.width=16, fig.height=10}
+rules_viz <- head(sort(rules_bipolar2, by = "lift", decreasing = TRUE), 10)
+  
+plot(rules_viz, method = "paracoord", control = list(reorder = TRUE),
+       main = "Symptom Patterns Leading to Bipolar Type-2")
+
+```
+
+
+```{r viz_bp3_grouped, fig.width=14, fig.height=10}
+plot(rules_bipolar2, method="grouped") 
+```
+
+**Interpretation**: Bipolar Type-2 shows a distinct pattern characterized by **mood swings with low optimism and suicidal thoughts**, along with nervous breakdowns. 
+
+## Symptom Patterns Predicting Depression
+
+What symptom combinations differentiate Major Depressive Disorder from bipolar disorders?
+
+```{r rules_depression}
+rules_depression <- apriori(data = patient_data, 
+                            parameter = list(supp = 0.1, conf = 0.6), 
+                            appearance = list(default = "lhs", 
+                                             rhs = "Diagnosis=Depression"), 
+                            control = list(verbose = FALSE))
+
+cat("Found", length(rules_depression), "rules for Depression\n\n")
+
+inspect(sort(rules_depression, by = "confidence", decreasing = TRUE)[1:10], digits = 2, linebreak = FALSE)
+```
+```{r viz_depression_lift}
+inspect(sort(rules_depression, by = "lift", decreasing = TRUE)[1:10], digits = 2, linebreak = FALSE)
+```
+
+### Visualization: Depression
+
+```{r viz_dep_paracoord, fig.width=16, fig.height=10}
+rules_viz <- head(sort(rules_depression, by = "lift", decreasing = TRUE), 10)
+  
+plot(rules_viz, method = "paracoord", control = list(reorder = TRUE),
+       main = "Symptom Patterns Leading to Depression")
+
+```
+
+```{r viz_dep_grouped, fig.width=14, fig.height=10}
+plot(rules_depression, method="grouped") 
+```
+
+**Interpretation**: Depression is characterized by the **ABSENCE of mood swings** (a key differentiator from bipolar disorders), combined with **suicidal thoughts and overthinking**. The high confidence rules show that when mood swings are absent but suicidal ideation is present, depression is highly likely.
+
+## Characteristics of Mentally Healthy Individuals
+
+What patterns characterize individuals without mental health disorders?
+
+```{r rules_normal}
+rules_normal <- apriori(data = patient_data, 
+                        parameter = list(supp = 0.1, conf = 0.6), 
+                        appearance = list(default = "lhs", 
+                                         rhs = "Diagnosis=Normal"), 
+                        control = list(verbose = FALSE))
+
+cat("Found", length(rules_normal), "rules for Normal\n\n")
+
+inspect(sort(rules_normal, by = "confidence", decreasing = TRUE)[1:10], digits = 2, linebreak = FALSE)
+```
+```{r rules_normal_lift}
+inspect(sort(rules_normal, by = "lift", decreasing = TRUE)[1:10], digits = 2, linebreak = FALSE)
+```
+### Visualization: Normal
+
+```{r viz_normal_paracoord, fig.width=16, fig.height=10}
+rules_viz <- head(sort(rules_normal, by = "lift", decreasing = TRUE), 10)
+  
+plot(rules_viz, method = "paracoord", control = list(reorder = TRUE),
+       main = "Characteristics of Normal (Healthy) Individuals")
+
+```
+
+```{r viz_normal_grouped, fig.width=14, fig.height=10}
+plot(rules_normal, method="grouped") 
+```
+
+**Interpretation**: Normal individuals are characterized by the **absence of both mood swings AND suicidal thoughts**, combined with positive behavioral traits like **authority respect** and **ability to admit mistakes**. These patterns represent emotional stability and healthy psychological functioning.
+
+# Critical Finding: Mood Swing as Super-Discriminator
+
+Let us examine one of the most critical findings from our analysis. The presence or absence of mood swings.
+
+```{r mood_swing_analysis}
+# Cross-tabulation
+mood_diag <- table(data$Mood_Swing, data$Diagnosis)
+print(mood_diag)
+
+mood_pct <- prop.table(mood_diag, margin = 1) * 100
+print(round(mood_pct, 1))
+```
+
+The presence or absence of mood swings achieves over 95% accuracy in differentiating bipolar disorders from depression and normal individuals.
+
+# Conclusion
+
+To conclude, association rules is a very powerful tool for discovering patterns in psychological survey data. This research uncovered distinct symptom profiles for each mental health condition—patterns.
+
+Clear Diagnostic Signatures for each diagnosis:
+
+Bipolar Type-1: Mood swings + euphoria + aggressive behavior. Classic manic presentation.
+
+Bipolar Type-2: Mood swings + deep sadness + suicidal thoughts. Bipolar Type-2 have suicidal ideation—higher than Type-1.
+
+Depression: No mood swings + low optimism + suicidal thoughts + overthinking. The absence of mood swings is the key differentiator from bipolar.
+
+Normal/Healthy: No mood swings + no suicidal thoughts + positive behaviors like respect and self-awareness. Emotional stability, not just absence of symptoms.
+
+Mood swings is the most critical symptom in determination of Bipolar disorder. 
