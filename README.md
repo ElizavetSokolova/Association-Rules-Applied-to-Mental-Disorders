@@ -13,14 +13,6 @@ Source of dataset: https://dataverse.harvard.edu/dataset.xhtml?persistentId=doi:
 
 This implementation may help to better understand the causalities between the patients’ characteristics and symptom patterns, extending beyond simple correlation analysis.
 
-Step-by-step, the work will look as follows:
-
-Loading and inspecting data
-Feature preprocessing (discretization of rating scales)
-Frequency inspection of symptoms
-Discovering symptom patterns and diagnostic rules
-Visualization and clinical interpretation
-
 ## Dataset
 
 **Source:** Mental Disorders Diagnostic Survey  
